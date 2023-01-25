@@ -24,6 +24,28 @@ MODEL_CACHE = "diffusers-cache"
 SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
 
 
+def download_lora(url):
+    from hashlib import sha512
+
+    fn = sha512(url.encode()).hexdigest() + ".safetensors"
+
+    if not os.path.exists(fn):
+        import requests
+
+        print("Downloading LoRA model... from", url)
+        # stream chunks of the file to disk
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(fn, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+    else:
+        print("Using cached LoRA model...")
+
+    return fn
+
+
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
@@ -39,8 +61,6 @@ class Predictor(BasePredictor):
             cache_dir=MODEL_CACHE,
             local_files_only=True,
         ).to("cuda")
-
-        patch_pipe(self.pipe, "analog_svd_rank8.safetensors")
 
     @torch.inference_mode()
     def predict(
@@ -91,10 +111,8 @@ class Predictor(BasePredictor):
             ],
             description="Choose a scheduler.",
         ),
-        lora: str = Input(
-            default="modern_disney",
-            choices=["modern_disney", "analog"],
-            description="Choose a lora model.",
+        lora_url: str = Input(
+            description="url for safetensors of lora model.",
         ),
         lora_scale: float = Input(
             description="LoRA scale for weight interpolation",
@@ -120,7 +138,12 @@ class Predictor(BasePredictor):
 
         generator = torch.Generator("cuda").manual_seed(seed)
 
-        patch_pipe(self.pipe, f"{lora}_svd_rank8.safetensors")
+        if not lora_url:
+            raise ValueError("Please specify a LoRA model url.")
+
+        local_lora_safetensors = download_lora(lora_url)
+
+        patch_pipe(self.pipe, local_lora_safetensors)
         tune_lora_scale(self.pipe.unet, lora_scale)
         tune_lora_scale(self.pipe.text_encoder, lora_scale)
 
