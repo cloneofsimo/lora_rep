@@ -17,6 +17,7 @@ from diffusers.pipelines.stable_diffusion.safety_checker import (
 )
 
 from lora_diffusion import patch_pipe, tune_lora_scale
+import time
 
 
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
@@ -41,7 +42,7 @@ def download_lora(url):
                     f.write(chunk)
 
     else:
-        print("Using cached LoRA model...")
+        print("Using disk cache...")
 
     return fn
 
@@ -61,6 +62,25 @@ class Predictor(BasePredictor):
             cache_dir=MODEL_CACHE,
             local_files_only=True,
         ).to("cuda")
+
+        self.loaded = None
+
+    def load_lora(self, url, scale):
+        if url == self.loaded:
+            print("The requested LoRA model is already loaded...")
+            return
+
+        start_time = time.time()
+        local_lora_safetensors = download_lora(url)
+        print("download_lora time:", time.time() - start_time)
+
+        start_time = time.time()
+        patch_pipe(self.pipe, local_lora_safetensors)
+        tune_lora_scale(self.pipe.unet, scale)
+        tune_lora_scale(self.pipe.text_encoder, scale)
+        print("patch_pipe itme:", time.time() - start_time)
+
+        self.loaded = url
 
     @torch.inference_mode()
     def predict(
@@ -134,18 +154,14 @@ class Predictor(BasePredictor):
                 "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
             )
 
+        if not lora_url:
+            raise ValueError("Please specify a LoRA model url.")
+
         self.pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
 
         generator = torch.Generator("cuda").manual_seed(seed)
 
-        if not lora_url:
-            raise ValueError("Please specify a LoRA model url.")
-
-        local_lora_safetensors = download_lora(lora_url)
-
-        patch_pipe(self.pipe, local_lora_safetensors)
-        tune_lora_scale(self.pipe.unet, lora_scale)
-        tune_lora_scale(self.pipe.text_encoder, lora_scale)
+        self.load_lora(lora_url, lora_scale)
 
         output = self.pipe(
             prompt=[prompt] * num_outputs if prompt is not None else None,
