@@ -68,17 +68,19 @@ class Predictor(BasePredictor):
     def load_lora(self, url, scale):
         if url == self.loaded:
             print("The requested LoRA model is already loaded...")
-            return
+        else:
+            start_time = time.time()
+            local_lora_safetensors = download_lora(url)
+            print("download_lora time:", time.time() - start_time)
+
+            start_time = time.time()
+            patch_pipe(self.pipe, local_lora_safetensors)
+            print("patch_pipe time:", time.time() - start_time)
 
         start_time = time.time()
-        local_lora_safetensors = download_lora(url)
-        print("download_lora time:", time.time() - start_time)
-
-        start_time = time.time()
-        patch_pipe(self.pipe, local_lora_safetensors)
         tune_lora_scale(self.pipe.unet, scale)
         tune_lora_scale(self.pipe.text_encoder, scale)
-        print("patch_pipe itme:", time.time() - start_time)
+        print("tune_lora_scale time:", time.time() - start_time)
 
         self.loaded = url
 
