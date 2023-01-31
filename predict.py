@@ -1,3 +1,4 @@
+from hashlib import sha512
 import os
 from typing import List
 import time
@@ -25,10 +26,12 @@ MODEL_CACHE = "diffusers-cache"
 SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
 
 
-def download_lora(url):
-    from hashlib import sha512
+def url_local_fn(url):
+    return sha512(url.encode()).hexdigest() + ".safetensors"
 
-    fn = sha512(url.encode()).hexdigest() + ".safetensors"
+
+def download_lora(url):
+    fn = url_local_fn(url)
 
     if not os.path.exists(fn):
         import requests
@@ -47,8 +50,9 @@ def download_lora(url):
     return fn
 
 
-def lora_add(path_1, alpha_1, path_2, alpha_2, output_path="output.safetensors"):
+def lora_add(merged_fn, path_1, alpha_1, path_2, alpha_2):
     """Scales each lora by appropriate weights & returns"""
+    start_time = time.time()
     safeloras_1 = safe_open(path_1, framework="pt", device="cpu")
     safeloras_2 = safe_open(path_2, framework="pt", device="cpu")
 
@@ -74,11 +78,12 @@ def lora_add(path_1, alpha_1, path_2, alpha_2, output_path="output.safetensors")
 
             ret_tensor[keys] = tens1
 
+    print(f"merge time: {time.time() - start_time}")
+
     # we don't need to go to-> from safetensors here, adding in now for compat's sake
     start_time = time.time()
-    save_file(ret_tensor, output_path, metadata)
+    save_file(ret_tensor, merged_fn, metadata)
     print(f"saving time: {time.time() - start_time}")
-    return output_path
 
 
 class Predictor(BasePredictor):
@@ -100,8 +105,9 @@ class Predictor(BasePredictor):
         self.loaded = None
 
     def merge_loras(self, url_1, scale_1, url_2, scale_2):
-        merged_lora_ref = f"{a}-{b}-{scale_1}-{scale-2}"
-        if self.loaded == merged_lora_ref:
+        merged_fn = url_local_fn(f"{url_1}-{url_2}-{scale_1}-{scale_2}")
+
+        if self.loaded == merged_fn:
             print("The requested two LoRAs are already scaled and loaded.")
             return
 
@@ -109,12 +115,12 @@ class Predictor(BasePredictor):
         lora_2 = download_lora(url_2)
 
         st = time.time()
-        local_lora_path = lora_add(lora_1, scale_1, lora_2, scale_2)
+        lora_add(merged_fn, lora_1, scale_1, lora_2, scale_2)
         print(f"merging time: {time.time() - st}")
 
-        patch_pipe(self.pipe, local_lora_path)
+        patch_pipe(self.pipe, merged_fn)
         # merging tunes lora scale so we don't need to do that here.
-        self.loaded = merged_lora_ref
+        self.loaded = merged_fn
 
     def load_lora(self, url, scale):
         if url == self.loaded:
