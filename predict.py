@@ -18,12 +18,65 @@ from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
 
-from lora_diffusion import patch_pipe, tune_lora_scale
+from lora_diffusion import patch_pipe, tune_lora_scale, set_lora_diag
+
 from safetensors.torch import safe_open, save_file
 
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
 MODEL_CACHE = "diffusers-cache"
 SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
+
+
+def lora_join(lora_safetenors: list):
+    metadatas = [dict(safelora.metadata()) for safelora in lora_safetenors]
+    total_metadata = {}
+    total_tensor = {}
+    total_rank = 0
+    ranklist = []
+    for _metadata in metadatas:
+        rankset = []
+        for k, v in _metadata.items():
+            if k.endswith("rank"):
+                rankset.append(int(v))
+
+        assert len(set(rankset)) == 1, "Rank should be the same per model"
+        total_rank += rankset[0]
+        total_metadata.update(_metadata)
+        ranklist.append(rankset[0])
+
+    tensorkeys = set()
+    for safelora in lora_safetenors:
+        tensorkeys.update(safelora.keys())
+
+    for keys in tensorkeys:
+        if keys.startswith("text_encoder") or keys.startswith("unet"):
+            tensorset = [safelora.get_tensor(keys) for safelora in lora_safetenors]
+
+            is_down = keys.endswith("down")
+
+            if is_down:
+                _tensor = torch.cat(tensorset, dim=0)
+                assert _tensor.shape[0] == total_rank
+            else:
+                _tensor = torch.cat(tensorset, dim=1)
+                assert _tensor.shape[1] == total_rank
+
+            total_tensor[keys] = _tensor
+            keys_rank = ":".join(keys.split(":")[:-1]) + ":rank"
+            total_metadata[keys_rank] = str(total_rank)
+    token_size_list = []
+    for idx, safelora in enumerate(lora_safetenors):
+        tokens = [k for k, v in safelora.metadata().items() if v == "<embed>"]
+        for jdx, token in enumerate(sorted(tokens)):
+            if total_metadata.get(token, None) is not None:
+                del total_metadata[token]
+            total_tensor[f"<s{idx}-{jdx}>"] = safelora.get_tensor(token)
+            total_metadata[f"<s{idx}-{jdx}>"] = "<embed>"
+            print(f"Embedding {token} replaced to <s{idx}-{jdx}>")
+
+        token_size_list.append(len(tokens))
+
+    return total_tensor, total_metadata, ranklist, token_size_list
 
 
 def url_local_fn(url):
@@ -122,6 +175,37 @@ class Predictor(BasePredictor):
         # merging tunes lora scale so we don't need to do that here.
         self.loaded = merged_fn
 
+    def join_many_lora(self, urllists: List[str], scales: List[float]):
+        assert len(urllists) == len(scales), "Number of LoRAs and scales must match."
+
+        merged_fn = url_local_fn(f"{'-'.join(urllists)}")
+
+        if self.loaded == merged_fn:
+            print("The requested LoRAs are loaded.")
+
+        else:
+            lora_safetenors = [
+                safe_open(download_lora(url), framework="pt", device="cpu")
+                for url in urllists
+            ]
+            st = time.time()
+
+            tensors, metadata, ranklist, token_size_list = lora_join(lora_safetenors)
+            save_file(tensors, merged_fn, metadata)
+
+            print(f"merging time: {time.time() - st}")
+
+            patch_pipe(self.pipe, merged_fn)
+            self.loaded = merged_fn
+            self.token_size_list = token_size_list
+            self.ranklist = ranklist
+
+        diags = []
+        for scale, rank in zip(scales, self.ranklist):
+            diags = diags + [scale] * rank
+
+        set_lora_diag(self.pipe.unet, torch.tensor(diags))
+
     def load_lora(self, url, scale):
         if url == self.loaded:
             print("The requested LoRA model is already loaded...")
@@ -163,10 +247,10 @@ class Predictor(BasePredictor):
             choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
             default=768,
         ),
-        prompt_strength: float = Input(
-            description="Prompt strength when using init image. 1.0 corresponds to full destruction of information in init image",
-            default=0.8,
-        ),
+        # prompt_strength: float = Input(
+        #     description="Prompt strength when using init image. 1.0 corresponds to full destruction of information in init image",
+        #     default=0.8,
+        # ),
         num_outputs: int = Input(
             description="Number of images to output.",
             ge=1,
@@ -193,6 +277,7 @@ class Predictor(BasePredictor):
         ),
         lora_1_url: str = Input(
             description="url for safetensors of lora model.",
+            default=None,
         ),
         lora_1_scale: float = Input(
             description="LoRA scale for weight interpolation",
@@ -202,12 +287,21 @@ class Predictor(BasePredictor):
         ),
         lora_2_url: str = Input(
             description="(Optional) url for safetensors of second lora model.",
+            default=None,
         ),
         lora_2_scale: float = Input(
             description="(Optional) LoRA scale for weight interpolation, lora_1_scale*lora_1 + lora_2_scale*lora_2. Scales don't have to sum to 1.",
             ge=0.0,
             le=4.0,
             default=0.8,
+        ),
+        list_of_lora_urls: str = Input(
+            description="(Optional) list of urls for safetensors of lora models, seperated with | . If provided, it will override all above options.",
+            default=None,
+        ),
+        list_of_lora_scales: str = Input(
+            description="(Optional) list of scales for safetensors of lora models, seperated with | ",
+            default=None,
         ),
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
@@ -223,7 +317,7 @@ class Predictor(BasePredictor):
                 "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
             )
 
-        if not lora_1_url:
+        if not (lora_1_url or list_of_lora_urls):
             raise ValueError("Please specify a LoRA model url.")
 
         self.pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
@@ -232,6 +326,18 @@ class Predictor(BasePredictor):
 
         if lora_2_url:
             self.merge_loras(lora_1_url, lora_1_scale, lora_2_url, lora_2_scale)
+        elif list_of_lora_scales:
+            list_of_lora_urls = list_of_lora_urls.split("|")
+            list_of_lora_scales = list_of_lora_scales.split("|")
+            list_of_lora_scales = [float(scale) for scale in list_of_lora_scales]
+            self.join_many_lora(list_of_lora_urls, list_of_lora_scales)
+            if prompt is not None:
+                for idx, tok_size in enumerate(self.token_size_list):
+
+                    prompt = prompt.replace(
+                        f"<{idx}>",
+                        "".join([f"<s{idx}-{jdx}>" for jdx in range(tok_size)]),
+                    )
         else:
             self.load_lora(lora_1_url, lora_1_scale)
 
